@@ -31,6 +31,7 @@
     - I could download the GH repos, any other source I need, and dd the image, all at the same time
 - Banana Pi support
 - Set GPU memory to the minimum allowed. I think it's 16MB, while default is 64MB. 
+- Don't wait to bring up network before offering login over serial
 
 ## Less important TODO items
 
@@ -38,6 +39,7 @@
 - I fucking cannot get fucking locales to fucking work fucking noninteractively. I keep having to fucking `dpkg-reconfigure locales` and fucking manually fucking select the fucking locale.
     - Maybe this will help. i don't fuckin know though. http://www.debian-administration.org/article/394/Automating_new_Debian_installations_with_preseeding
     - This fucking didn't fucking help: http://stackoverflow.com/questions/8671308/non-interactive-method-for-dpkg-reconfigure
+- The deboostrap steps I use result in some fucked up characters getting written to the serial console during boot. Still works to log in but it looks ugly.
     
 ## Experiments / troubleshooting
 
