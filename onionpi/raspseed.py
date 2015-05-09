@@ -18,14 +18,6 @@ from pdb import set_trace as strace
 
 # TODO: PEP8-ify this, I do a lot of things in a non-standard way apparently
 
-
-## Changeable stuff
-#mainline_kernel_url = 'https://www.kernel.org/pub/linux/kernel/v3.x/linux-3.18.11.tar.xz'
-mainline_kernel_url = 'https://www.kernel.org/pub/linux/kernel/v4.x/linux-4.0.tar.xz'
-mainline_kernel_filename = re.match('.*/(.*)', mainline_kernel_url).group(1)
-
-## End changeable stuff
-
 # TODO: would be better to have printed output & logging configured in the same place
 # TODO: if we need to capture the output of *one* chroot command, this doesn't work because of set -v
 def sh(commandline, env=None, printoutput=True, chroot=None, cwd=None):
@@ -35,6 +27,7 @@ def sh(commandline, env=None, printoutput=True, chroot=None, cwd=None):
     if chroot:
         if not (os.path.isdir(chroot)):
             raise Exception("chroot dir '{}' does not exist".format(chroot))
+        logging.debug('chroot into {}'.format(chroot))
         nowstamp = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S')
         cs_name = "chroot_{}.sh".format(nowstamp)
         cs_path = "{}/root/{}".format(chroot, cs_name)
@@ -42,9 +35,7 @@ def sh(commandline, env=None, printoutput=True, chroot=None, cwd=None):
             '#!/bin/bash',
             'set -e',         # fail immediately on error
             ". /etc/profile", # otherwise we get complaints the $PATH isn't set
-            'set -v',         # write each line to output before executing it
-            #"mount -t proc proc /proc", # this should have already been done tbh
-            ]
+            'set -v']         # write each line to output before executing it
         cs_contents = cs_prefix + commandline
         write_file(cs_contents, cs_path, append=False, mode=0o700)
         outercmd = ["chroot {} /root/{}".format(chroot, cs_name)]
@@ -53,8 +44,12 @@ def sh(commandline, env=None, printoutput=True, chroot=None, cwd=None):
 
     outputs = []
     for cli in outercmd:
-        print("==== Running command: {}".format(cli))
-        pristine_output = subprocess.check_output(cli, shell=True, env=env)
+        print('\n'.join([
+                    "==== Running command: {}".format(cli),
+                    "     chroot: {}".format(chroot),
+                    "     cwd:    {}".format(cwd),
+                    "     env:    {}".format(env)]))
+        pristine_output = subprocess.check_output(cli, shell=True, env=env, cwd=cwd)
         output = pristine_output.strip('\r\n') # Trims newlines @ beginning/end only
         if printoutput and len(output) > 0:
             print(output)
@@ -86,6 +81,34 @@ def write_file(contents, filename, append=True, mode=False, uniqueonly=False):
     if mode:
         os.chmod(filename, mode)
 
+def disable_chroot_daemons(chroot):
+    """
+    Disable daemons from starting in a chroot
+    Run this before installing daemon packages like ssh or tor
+    """
+    # Normally, policy-rc.d doesn't exist. If it does, then daemons have already been disabled
+    if os.path.exists(chroot+'/usr/sbin/policy-rc.d'):
+        return
+    write_file(['#!/bin/sh', 'exit 101'], chroot+'/usr/sbin/policy-rc.d', mode=0o755)
+    os.link(chroot+'/bin/true', chroot+'/usr/sbin/invoke-rc.d')
+    sh(
+        'dpkg-divert --add --local --divert /usr/sbin/invoke-rc.d.chroot --rename /usr/sbin/invoke-rc.d', 
+        env={ 'LANG':'C' }, chroot=chroot)
+
+def enable_chroot_daemons(chroot):
+    """
+    Re-enable daemons to start in the chroot
+    Run this before finishing an image
+    """
+    # In a pristine system, policy-rc.d doesn't exist; if it doesn't now, then daemons are already enabled
+    if not os.path.exists(chroot+'/usr/sbin/policy-rc.d'):
+        return
+    os.remove(chroot+'/usr/sbin/policy-rc.d')
+    os.remove(chroot+'/usr/sbin/invoke-rc.d')
+    sh(
+        'dpkg-divert --remove --rename /usr/sbin/invoke-rc.d',
+        env={ 'LANG':'C' }, chroot=chroot)
+
 def makedirs(path, mode=0o755, exist_ok=False):
     """Replacement for os.makedirs() w/ the Py3 feature of exists_ok"""
     if os.path.exists(path) and exist_ok:
@@ -99,6 +122,7 @@ def mount(device, mountpoint, fstype=None, fsoptions=None):
     If the device is already mounted there, do nothing
     If something else is already mounted there, raise an exception
     """
+    mountpoint = os.path.abspath(mountpoint)
     makedirs(mountpoint, mode=0o755, exist_ok=True)
 
     fs_type = "-t {}".format(fstype) if fstype else ""
@@ -116,10 +140,17 @@ def mount(device, mountpoint, fstype=None, fsoptions=None):
 
 def umount(mountpoint):
     """Use /bin/umount to unmount a device"""
-    for mount in sh('mount', printoutput=False).split('\n'):
-        exdevice, exmountpoint = re.search('(.+) on (.+) type ', mount).group(1, 2)
-        if exmountpoint == mountpoint:
+    if os.path.exists(mountpoint):
+        try:
             sh('umount "{}"'.format(mountpoint))
+        except:
+            pass
+    # for mount in sh('mount', printoutput=False).split('\n'):
+    #     exdevice, exmountpoint = re.search('(.+) on (.+) type ', mount).group(1, 2)
+    #     if mount['fstype'] and exmountpoint == mountpoint:
+    #         sh('umount "{}"'.format(mountpoint))
+    #     elif exdevice == device:
+    #         sh('umount'.format(
 
 def check_loopdev(image):
     """Use /sbin/losetup to check if an image has been attached as a loopback device"""
@@ -137,68 +168,85 @@ def check_loopdev(image):
         logging.info("No image at path '{}'".format(image))
     return retval    
 
-# This isn't ideal. You'd like to store the finalstatus as part of the OnionPiImage instance itself, but I can't figure out how to do that, because I need to reference it from within statusmethod()
-'''When an OnionPiImage reachest this status, it is finished'''
+# Can't be a member property of RaspSeedImage because it's used in some global functions
+depsdir = os.getcwd()+'/dependencies'
+
+# This isn't ideal. You'd like to store the finalstatus as part of the RaspSeedImage instance itself, but I can't figure out how to do that, because I need to reference it from within the statusmethod decorator
+'''When an RaspSeedImage reachest this status, it is finished'''
 finalstatus = 0
 statusmethods = []
 def statusmethod(func):
-    global finalstatus
-    global statusmethods
-    finalstatus += 1
+    '''
+    Decorator for RaspSeedImage methods that set the image's status.
+    Methods must be defined *in status order*, because the first function 
+    decorated with @statusmethod will be assigned the property '.status = 1'
+    and the second will be assigned '.status = 2' etc. 
+    '''
+    global finalstatus, statusmethods
     func.status = finalstatus
     def wrapper(class_instance, *args, **kwargs):
+        logging.info("Running status function #{}: {}".format(
+                func.status, func.__name__))
         func(class_instance, *args, **kwargs)
         class_instance.status = func.status
-    wrapper.status = func.status
-    wrapper.__orig_name__ = func.__name__
+    wrapper.wrapped = func
     statusmethods += [wrapper]
+    finalstatus += 1
     return wrapper
 
-# TODO: have every method require a version level and then DTRT if the image is not at that version level
-class OnionPiImage(object):
+class RaspSeedImage(object):
 
-    # Kali uses 3000MB
-    # My debian minimal w/ sjoerd was just BARELY under 1024MB total
+    # Kali uses 3000MB. My initial experiment, a minimal debootstrap w/ sjoerd's
+    # kernel, was just BARELY under 1024MB total
     min_size = 1536
+    default_imagename = "raspseed.img"
+    default_hostname  = "raspseed"
+    default_arch      = "armhf"
+    default_debmirr   = "ftp://ftp.debian.org/debian"
 
-    def __init__(self, imagepath,
-                 mountpoint=None, imagesize=None, workdir=None, 
-                 debianversion="sid", hostname="onionpi", 
-                 kernel_method="sjoerd"):
+    compilable_kernels = {
+        'rpi': {
+            'url': 'https://github.com/raspberrypi/linux/archive/rpi-3.18.y.zip',
+            'foldername': 'linux-rpi-3.18.y',
+            'extractcmd': 'unzip'},
+        #'mainline40': {
+        'mainline': {
+            'url': 'https://www.kernel.org/pub/linux/kernel/v4.x/linux-4.0.tar.xz',
+            'foldername': 'linux-4.0',
+            'extractcmd': 'tar xf'}
+        }
+
+    kernel_config_url = 'https://raw.githubusercontent.com/raspberrypi/linux/rpi-3.18.y/arch/arm/configs/bcm2709_defconfig'
+
+    def __init__(self, imagepath=os.getcwd()+default_imagename,
+                 imagesize=None, debianversion="sid",
+                 kernel="sjoerd"):
         '''
-        __init__ should *not* make any modifications to actual files on disk! We rely on this in various places, so if it changes, stuff might break and **data could be deleted**.
+        __init__() should *not* make any modifications to actual files on disk! We rely on this in various places, so if it changes, stuff might break and **data could be deleted**.
         '''
 
         self.imagepath = imagepath
         self.imagedir, self.imagename = re.search('(.*)\/(.*)$', imagepath).group(1, 2)
 
+        self.statfile   = self.imagepath+'.status.txt'
+        self.mountpoint = self.imagepath+'.mnt'
+        self.debianvers = debianversion
+        self.hostname   = RaspSeedImage.default_hostname
+        self.arch       = RaspSeedImage.default_arch
+        self.debmirr    = RaspSeedImage.default_debmirr
+        self.kernel     = kernel
+        self.rootdev    = None 
+        self.bootdev    = None
+
         if os.path.isfile(self.imagepath):
             self.imagesize = os.stat(self.imagepath).st_size / 1024 / 1024
         else:
-            self.imagesize = imagesize if imagesize else OnionPiImage.min_size
+            self.imagesize = imagesize if imagesize else RaspSeedImage.min_size
         logging.info("Using a size of {}MB".format(self.imagesize))
-        if self.imagesize < OnionPiImage.min_size:
-            raise Exception("imagesize {}MB smaller than minimum size of {}MB".format(self.imagesize, OnionPiImage.min_size))
-
-        self.kernel_method = kernel_method
-
-        if not mountpoint:
-            mountpoint = '/mnt/'+self.imagename
-        if not workdir:
-            workdir = '/tmp/'+self.imagename
-        self.mountpoint = mountpoint
-        self.workdir = workdir
-        self.debianversion = debianversion
-        self.hostname = hostname
-
-        self.arch = "armhf"
-        self.debmirr = "ftp://ftp.debian.org/debian"
+        if self.imagesize < RaspSeedImage.min_size:
+            raise Exception("imagesize {}MB smaller than minimum size of {}MB".format(self.imagesize, RaspSeedImage.min_size))
 
         logging.info(self)
-
-        self.rootdev = None
-        self.bootdev = None
-
 
     @property
     def mounts(self):
@@ -211,32 +259,13 @@ class OnionPiImage(object):
             { 'device': '/dev/pts',   'mountpoint': self.mountpoint+'/dev/pts',       'fstype': None,   'fsoptions': 'bind' }]
 
     @property
-    def statfile(self):
-        """The location of the status file"""
-        return "{}.status.txt".format(self.imagepath)
-
-    @property
     def status(self):
         """The current status of the image, as read from the status file"""
         if not os.path.exists(self.imagepath):
             return 0
-        
-        if not os.path.exists(self.statfile):
-            raise Exception("Image exists but statfile does not")
-
         with open(self.statfile) as f:
             line1 = f.readline()
-
-        try:
-            statint = int(line1)
-        except:
-            raise Exception("statfile is invalid format")
-
-        global finalstatus
-        if 0 < statint <= finalstatus:
-            return statint
-        else:
-            raise Exception('Invalid statfile')
+        return int(line1)
 
     @status.setter
     def status(self, status):
@@ -246,16 +275,15 @@ class OnionPiImage(object):
 
     def __str__(self):
         selfstring = '\n'.join([
-            "OnionPiImage(",
+            "RaspSeedImage(",
             "  "+self.imagepath,
             "  status: {} (from {})".format(self.status, self.statfile),
             "  size: {}MB".format(self.imagesize),
             "  mountpoint: "+self.mountpoint,
-            "  debian version: "+self.debianversion,
+            "  debian version: "+self.debianvers,
             "  hostname: "+self.hostname,
             "  architecture: "+self.arch,
-            "  debian mirror: "+self.debmirr,
-            "  hostname: {})".format(self.hostname)])
+            "  debian mirror: "+self.debmirr +")"])
         return selfstring
 
     def check_partitions(self):
@@ -346,22 +374,22 @@ class OnionPiImage(object):
     def debootstrap_stage1(self):
         self.mount_chroot()
         sh('qemu-debootstrap --verbose --arch={} "{}" "{}" "{}"'.format(
-            self.arch, self.debianversion, self.mountpoint, self.debmirr))
+            self.arch, self.debianvers, self.mountpoint, self.debmirr))
 
     @statusmethod
     def debootstrap_stage3(self):
         self.mount_chroot()
 
         sl_new = [
-            'deb http://ftp.debian.org/debian {} main contrib non-free'.format(self.debianversion),
-            'deb-src http://ftp.debian.org/debian {} main contrib non-free'.format(self.debianversion)]
+            'deb http://ftp.debian.org/debian {} main contrib non-free'.format(self.debianvers),
+            'deb-src http://ftp.debian.org/debian {} main contrib non-free'.format(self.debianvers)]
         write_file(sl_new, self.mountpoint+"/etc/apt/sources.list", append=True, mode=0o644)
 
         write_file([self.hostname], self.mountpoint+"/etc/hostname", append=False, mode=0o644)
 
         # Kali does this "so X doesn't complain": 
         hosts_contents = [
-            "127.0.0.1       {}    localhost".format(self.hostname),
+            "127.0.0.1       {} localhost".format(self.hostname),
             "::1             localhost ip6-localhost ip6-loopback",
             "fe00::0         ip6-localnet",
             "ff00::0         ip6-mcastprefix",
@@ -398,8 +426,7 @@ class OnionPiImage(object):
         stage3cmd = [
             'dpkg-divert --add --local --divert /usr/sbin/invoke-rc.d.chroot --rename /usr/sbin/invoke-rc.d',
             'cp /bin/true /usr/sbin/invoke-rc.d',
-            #'echo -e "#!/bin/sh\nexit 101" > /usr/sbin/policy-rc.d',
-            'echo -e "exit 101" > /usr/sbin/policy-rc.d',
+            'echo -e "#!/bin/sh\nexit 101" > /usr/sbin/policy-rc.d',
             'chmod +x /usr/sbin/policy-rc.d',
             'apt-get update',
             'apt-get install locales locales-all debconf-utils',
@@ -411,26 +438,23 @@ class OnionPiImage(object):
             # ... for non-sjoerd images, might have to build our own uboot. ugh.
             # ... oh, looks like this migrated to u-boot-tools: https://packages.debian.org/wheezy/uboot-mkimage
             # However, still not sure that it supports the Pi2 yet - it does support Pi1, but 2 support is unclear
-            #'apt-get -y install git-core binutils ca-certificates initramfs-tools uboot-mkimage',
+            #'apt-get -y install uboot-mkimage',
             'apt-get -y install git-core binutils ca-certificates initramfs-tools',
             'apt-get -y install console-common less nano git',
             'echo "root:toor" | chpasswd',
             '''sed -i -e 's/KERNEL\!=\"eth\*|/KERNEL\!=\"/' /lib/udev/rules.d/75-persistent-net-generator.rules''',
             'rm -f /etc/udev/rules.d/70-persistent-net.rules',
             'apt-get --yes --force-yes install $packages',
-            # (most of) my customizations are here:
             'apt-get install -y {}'.format(additional_packages),
             'locale-gen',
             'dpkg-reconfigure locales',
             'update-rc.d ssh enable',
-            # End my shit
             # Cleanup: 
             'rm -f /etc/ssh_host_*_key.pub',
             'rm -f /usr/sbin/policy-rc.d',
             'rm -f /usr/sbin/invoke-rc.d',
             'dpkg-divert --remove --rename /usr/sbin/invoke-rc.d',
             'rm -rf /root/.bash_history',
-            #'apt-get update',
             'apt-get clean',
             'rm -f /0',
             'rm -f /hs_err*',
@@ -445,82 +469,92 @@ class OnionPiImage(object):
         #sh("chroot {} /bin/ls /dev".format(self.mountpoint))
         return
 
-    @statusmethod
-    def install_kernel(self):
-        if self.kernel_method == 'sjoerd':
-            self.add_sjoerd_kernel()
-        elif self.kernel_method == 'mainline':
-            self.compile_kernel(kernel='mainline')
-        elif self.kernel_method == 'rpi':
-            self.compile_kernel(kernel='rpi')
-        else:
-            raise Exception('No such kernel method "{}"'.format(self.kernel_method))
+    def obtain_kernel_source(self, kernel):
+        k = self.compilable_kernels[kernel]
+        global depsdir
+        makedirs(depsdir, exist_ok=True)
+        archivename = re.match('.*/(.*)', k['url']).group(1)
+        kdir = "{}/{}".format(depsdir, k['foldername'])
+        # Download & extract the kernel source:
+        if not os.path.exists(kdir):
+            if not os.path.exists('{}/{}'.format(depsdir, archivename)):
+                sh('wget "{}"'.format(k['url']), cwd=depsdir)
+            sh('{} "{}"'.format(k['extractcmd'], archivename), cwd=depsdir)
+        configname = re.match('.*/(.*)', self.kernel_config_url).group(1)
+        configpath = "{}/arch/arm/configs/{}".format(
+            kdir, configname)
+        # Download the config
+        if not os.path.exists(configpath):
+            sh('wget "{}"'.format(self.kernel_config_url), 
+               cwd=kdir+"/arch/arm/configs")
+        # Download the firmware
+        fwdir = "{}/raspberrypi-firmware".format(depsdir)
+        if not os.path.exists(fwdir):
+            sh('git clone --depth 1 https://github.com/raspberrypi/firmware.git "{}"'.format(fwdir))
+        # Download the device tree source file
+        dts_path = kdir+'/arch/arm/boot/dts/bcm2709-rpi-2-b.dts'
+        dts_url = 'https://raw.githubusercontent.com/raspberrypi/linux/rpi-3.18.y/arch/arm/boot/dts/bcm2709-rpi-2-b.dts'
+        if not os.path.exists(dts_path):
+            sh('wget "{}"'.format(dts_url), cwd=kdir+'/arch/arm/boot/dts')
+    
 
-    def compile_linux_kernel(self, clean=False, kernel='mainline'):
-        """Compile a kernel from rpi sources. (Currently broken.)"""
-        self.mount_chroot()
-        makedirs(self.workdir, exist_ok=True)
+    def compile_linux_kernel(self, kernel):
+        global depsdir
+        k = self.compilable_kernels[kernel]
+        kdir = "{}/{}".format(depsdir, k['foldername'])
 
-        # TODO: <clean> doesn't work yet lol
-        # if clean and os.path.exists(kdir):
-        #     shutil.rmtree(kdir)
-        # else:
-        if kernel == 'mainline':
-            global mainline_kernel_filename
-            kdirname = re.match('(.*)\.tar\.xz', mainline_kernel_filename).group(1)
-            kdir = "{}/{}".format(self.workdir, kdirname)
-            if not os.path.isdir(kdir):
-                sh("tar xf '{}'".format(mainline_kernel_filename), cwd=self.workdir)
-            else:
-                sh('make clean', cwd=kdir)
-        elif kernel == 'rpi':
-            kdir = '{}/raspberrypi-linux'
-            if not os.path.isdir(kdir+'/.git'):
-                sh('git clone --depth 1 https://github.com/raspberrypi/linux -b rpi-3.18.y "{}"'.format(kdir))
-            else:
-                sh('git pull', cwd=kdir)
-                sh('make clean', cwd=kdir)
-        else:
-            raise Exception("I don't know how to make a kernel of type '{}'".format(kernel))
-        
-        # Compile the kernel
-        procs = 0
-        with open('/proc/cpuinfo') as f:
-            for line in f.readlines():
-                if re.match('processor', line):
-                    procs +=1
-        procs = procs * 1.5
+        # make sure the kdir has the device tree source code in it
+
+        zImage = kdir+'/arch/arm/boot/zImage'
+        dtb    = kdir+'/arch/arm/boot/dts/bcm2709-rpi-2-b.dtb'
+        logging.debug("kdir is {}".format(kdir))
         makeenv = {'ARCH': 'arm', 'CROSS_COMPILE': 'arm-linux-gnueabihf-'}
-        sh('make bcm2709_defconfig', env=makeenv, cwd=kdir)
-        sh('make -j {}'.format(procs), env=makeenv, cwd=kdir)
-        sh('make modules_install INSTALL_MOD_PATH="{}"'.format(self.mountpoint), env=makeenv, cwd=kdir)
-        shutil.copyfile(kdir+'/arch/arm/boot/zImage', self.mountpoint+'/boot/firmware/kernel7.img')
-        shutil.copyfile(kdir+'arch/arm/boot/dts/bcm2709-rpi-2-b.dtb', self.mountpoint+'/boot/firmware/')
+        if not os.path.exists(zImage) or not os.path.exists(dtb):
+            jobs = 0
+            with open('/proc/cpuinfo') as f:
+                for line in f.readlines():
+                    if re.match('processor', line):
+                        jobs +=1
+            jobs = int(jobs * 1.5)
+            # TODO: why will my make commands fail if I don't dot-source /etc/profile first? 
+            sh('; '.join(['. /etc/profile', 
+                          'echo "ARCH is $ARCH"', 
+                          'echo "CROSS_COMPILE is $CROSS_COMPILE"',
+                          'make bcm2709_defconfig',
+                          'make -j{}'.format(jobs)]),
+               env=makeenv, cwd=kdir)
 
+        # Install the kernel, device tree, modules, and firmware
+        self.mount_chroot()
+        sh('make modules_install INSTALL_MOD_PATH="{}"'.format(self.mountpoint),
+           env=makeenv, cwd=kdir)
+        shutil.copyfile(zImage, self.mountpoint+'/boot/firmware/kernel7.img')
+        shutil.copyfile(dtb,    self.mountpoint+'/boot/firmware/bcm2709-rpi-2-b.dtb')
+        fwdir = "{}/raspberrypi-firmware".format(depsdir)
+        sh('cp -rf "{}"/boot/* "{}"'.format(
+                fwdir, self.mountpoint+"/boot/firmware"))
         # Kali does this: is it necessary? Replaces the installed firmware w/ the mainline Linux firmware
         # rm -rf ${basedir}/root/lib/firmware
         # cd ${basedir}/root/lib
         # git clone --depth 1 https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git firmware
         # rm -rf ${basedir}/root/lib/firmware/.git
 
-        # Now get the raspberry pi firmware
-        makedirs(self.workdir, exist_ok=True)
-        fwdir = "{}/firmware".format(self.workdir)
+        # Create cmdline.txt and config.txt files for booting:
+        write_file(
+            'dwc_otg.fiq_fix_enable=1 console=ttyAMA0,115200 console=tty1 root=/dev/mmcblk0p2 rootfstype=ext4 rootwait ro rootflags=noload',
+            "{}/boot/firmware/cmdline.txt".format(self.mountpoint))
+        write_file(
+            'gpu_mem=16',
+            "{}/boot/firmware/config.txt".format(self.mountpoint))
 
-        if clean and os.path.exists(fwdir):
-            shutil.rmtree(fwdir)
-            sh('git clone --depth 1 https://github.com/raspberrypi/firmware.git "{}"'.format(fwdir))
+    @statusmethod
+    def install_kernel(self):
+        if self.kernel == 'sjoerd':
+            self.add_sjoerd_kernel()
+        else:
+            self.obtain_kernel_source(self.kernel)
+            self.compile_linux_kernel(self.kernel)
 
-        sh('cp -rf "{}"/boot/* "{}"'.format(fwdir, self.mountpoint+"/boot/firmware"))
-
-        # Create cmdline.txt file. Uses the Kali one as a starting point
-        cmdline_contents = 'dwc_otg.fiq_fix_enable=1 console=ttyAMA0,115200 console=tty1 root=/dev/mmcblk0p2 rootfstype=ext4 rootwait ro rootflags=noload'
-        write_file(cmdline_contents, "{}/boot/firmware/cmdline.txt".format(self.mountpoint))
-
-        # Create a config.txt just to avoid wasting memory on the graphics chip we won't be using
-        configtxt_contents = 'gpu_mem=16'
-        write_file(configtxt_contents, "{}/boot/firmware/config.txt".format(self.mountpoint))
-        
 
     # TODO: this doesn't require u-boot, meaning that the kernel step and the stage3 step are more segregated than my infrastructure currently allows. 
     # WHICH IS GOOD because apparently uboot is broken in jessie rn? Although the Pi 2 is supported in mainline UBoot so I could just build it myself
@@ -607,14 +641,15 @@ class OnionPiImage(object):
                 if os.path.exists(self.imagepath): os.remove(self.imagepath)
                 if os.path.exists(self.statfile): os.remove(self.statfile)
 
-        finish = finalstatus if finalstatus > statuslevel else statuslevel
+        finish = (statuslevel if statuslevel else finalstatus)
         for stat in range(self.status, finish):
             func = statusmethods[stat]
-            logging.info("Running function #{} - '{}' - {}".format(stat, func.__orig_name__, func.__doc__))
+            logging.info("Running function #{} - '{}' - {}".format(
+                    stat, func.wrapped.__name__, func.wrapped.__doc__))
             if not whatif:
                 # Basically when you call instance.method(), python calls Class.method(instance). These do the same thing:
-                #   imgobj = OnionPiImage(); imgobj.memberfunc(arg1, argN);
-                #   imgobj = OnionPiImage(); f=imgobj.memberfunc; f(imgobj, arg1, argN);
+                #   imgobj = RaspSeedImage(); imgobj.memberfunc(arg1, argN);
+                #   imgobj = RaspSeedImage(); f=RaspSeedImage.memberfunc; f(imgobj, arg1, argN);
                 # (This is why all class methods must have at least one argument, usually called 'self')
                 func(self)
 
@@ -626,13 +661,14 @@ def install_prereqs():
 
     # emdebian info, including repo URLs: http://www.emdebian.org/crosstools.html
     emdebian_host_packages = ""
-    host_packages = "dosfstools parted kpartx debootstrap qemu-user-static binfmt-support python ntp gcc-arm-linux-gnueabi bc"
+    host_packages = "dosfstools parted kpartx debootstrap qemu-user-static binfmt-support python ntp gcc-arm-linux-gnueabi bc unzip libncurses5-dev"
     logging.info("Installing host packages: {}".format(host_packages))
     sh("apt-get install -y {}".format(host_packages))
 
 # I only need to do this because I wanted to examine the packages more closely
 # Most people shouldn't need this
-def download_collabora_repo(depsdir):
+def download_collabora_repo():
+    global depsdir
     url = 'https://repositories.collabora.co.uk/debian/'
     colldir = depsdir+"/collabora-repository"
     makedirs(colldir, exist_ok=True)
@@ -641,99 +677,129 @@ def download_collabora_repo(depsdir):
         cwd=colldir)
         
 
-def main(*args):
+def get_argparser():
+    """
+    Build the argparse object, but do not parse the arguments
+    """
+    # ARGPARSE
     argparser = argparse.ArgumentParser(
         description='Build an image for the Raspberry Pi 2')
     subparsers = argparser.add_subparsers(dest='subparser')
 
-    argparser.add_argument('--verbose', '-v', action='count', 
-        help='Print verbose messages (-vv for debug messages)')
+    # For now, I set it to always display debug messages (below)
+    # argparser.add_argument(
+    #     '--verbose', '-v', action='count', 
+    #     help='Print verbose messages (-vv for debug messages)')
 
-    setupp = subparsers.add_parser('setup')
-    setupp.add_argument('--install-prereqs', '-p', action='store_true', dest='prereqs',
-        help='Install required packages on the chroot host')
-    # TODO: The default here is specific to my system; fix that
-    setupp.add_argument('--dependency-directory', action='store', 
-        dest='depsdir', default='/chroots/dependencies',
-        help='The directory to store downloaded dependencies')
-    setupp.add_argument('--download-collabora', action='store_true', dest='collabora',
-        help='Download all packages from the sjoerd/collabora repository so they can be examined')
-
-    infop = subparsers.add_parser('info')
-    infop.add_argument('--image-path', '-i', action='store', dest='imagepath',
+    # PARENT PARSERS
+    imagep = argparse.ArgumentParser(add_help=False)
+    imagep.add_argument(
+        '--image-path', '-i', action='store', dest='imagepath',
+        default=os.getcwd()+RaspSeedImage.default_imagename,
         help='The path to the image file')
-    infop.add_argument('--levels', '-l', action='store_true',
+
+    # SUBPARSERS
+    setups = subparsers.add_parser('setup')
+    setups.add_argument(
+        '--install-prereqs', '-p', action='store_true', dest='prereqs',
+        help='Install required packages on the chroot host')
+    setups.add_argument(
+        '--download-collabora', action='store_true', dest='collabora',
+        help='Download all packages from the sjoerd/collabora repository')
+
+    infos = subparsers.add_parser('info', parents=[imagep])
+    infos.add_argument(
+        '--levels', '-l', action='store_true',
         help='Show the different status levels possible for an image')
 
-    detachp = subparsers.add_parser('detach')
-    detachp.add_argument('imagepath', action='store', 
-        help='The path to the image file')
-    detachp.add_argument('--purge', '-p', action='store_true', 
-        help='Delete the image file, status file, and any working directories')
+    detachs = subparsers.add_parser('detach', parents=[imagep])
+
+    attachs = subparsers.add_parser('attach', parents=[imagep])
 
     # TODO: Add a way to tell it to bring it to a specific status level
-    imagep = subparsers.add_parser('image')
-    imagep.add_argument('imagepath', action='store', 
-        help='The path to the image file')
-    imagep.add_argument('--mountpoint', '-m', action='store', 
-        help='The path to use as a mountpoint. Default is to use a directory in /mnt based on the image filename')
-    imagep.add_argument('--imagesize', '-s', action='store', type=int, default=OnionPiImage.min_size,
-        help='The size of the image in megabytes')
-    imagep.add_argument('--debianversion', '-d', action='store', default='sid',
+    images = subparsers.add_parser('image', parents=[imagep])
+    images.add_argument(
+        '--imagesize', '-s', action='store', default=RaspSeedImage.min_size,
+        type=int, help='The size of the image in megabytes')
+    images.add_argument(
+        '--statuslevel', '-l', action='store', default=None, type=int, 
+        help='Do not take the image passt the specified statuslevel')
+    images.add_argument(
+        '--debianversion', '-d', action='store', default='sid',
         help='The version of debian to use')
-    imagep.add_argument('--overwrite', '-o', action='store_true',
+    images.add_argument(
+        '--overwrite', '-o', action='store_true', 
         help='Delete any existing image file')
-    imagep.add_argument('--whatif', '-n', action='store_true',
+    images.add_argument(
+        '--whatif', '-n', action='store_true',
         help='Take no action, but print what actions would be taken')
-    imagep.add_argument('--workdir', '-w', action='store',
-        help='Temporary directory for compiling etc. Default is to use a directory in /tmp based on the image filename')
-    imagep.add_argument('--kernel', '-k', action='store', 
+    images.add_argument(
+        '--kernel', '-k', action='store', 
         choices=['sjoerd','mainline','rpi'], default='sjoerd',
-        help='How to get the kernel? Can use precompiled binaries from sjoerd (working), compile the mainline kernel (currently broken), or compile the kernel w/ patches from the Raspberry Pi Foundation (unimplemented).')
+        help=' '.join(
+            ['How to get the kernel? Can use precompiled binaries',
+             'from sjoerd (working), compile the mainline kernel (currently',
+             'broken), or compile the kernel w/ patches from the Raspberry Pi',
+             'Foundation (unimplemented).']))
 
-    parsed = argparser.parse_args()
+    return argparser
 
-    if parsed.verbose == 1:
-        logging.basicConfig(format='%(levelname)s: %(message)s',level=logging.INFO)
-    elif parsed.verbose > 1:
-        logging.basicConfig(format='%(levelname)s: %(message)s',level=logging.DEBUG)
-    logging.info("Informational messages on")
-    logging.debug("Debug messages on")
-    logging.debug("Arguments passed on cli: {}".format(args))
-    logging.debug("Arguments after parsing: {}".format(parsed))
 
-    if parsed.subparser == 'setup':
-        depsdir = parsed.depsdir
-        if parsed.prereqss: install_prereqs()
-        if parsed.collabora: download_collabora_repo(depsdir)
+def parse_args(parser, *args):
+    parsedargs = parser.parse_args()
+    
+    ### ALWAYS DISPLAY DEBUG MESSAGES
+    # if not parsedargs.verbose: 
+    #     logging.basicConfig(format='%(levelname)s: %(message)s')
+    # elif parsedargs.verbose == 1:
+    #     logging.basicConfig(format='%(levelname)s: %(message)s',level=logging.INFO)
+    # elif parsedargs.verbose > 1:
+    #    logging.basicConfig(format='%(levelname)s: %(message)s',level=logging.DEBUG)        
+    logging.basicConfig(format='%(levelname)s: %(message)s',level=logging.DEBUG)        
+    logging.debug("Arguments after parsing: {}".format(parsedargs))
 
-    elif parsed.subparser == 'image':
-        image = OnionPiImage(
-            imagepath = parsed.imagepath, 
-            mountpoint = parsed.mountpoint, 
-            imagesize = parsed.imagesize, 
-            debianversion = parsed.debianversion, 
-            kernel_method = parsed.kernel,
-            workdir=parsed.workdir)
+    return parsedargs
+
+def execute(parsedargs, post_setup=None, post_image=None):
+
+    if parsedargs.subparser == 'setup':
+        if parsedargs.prereqss: install_prereqs()
+        if parsedargs.collabora: download_collabora_repo()
+
+    elif parsedargs.subparser == 'image':
+        image = RaspSeedImage(
+            imagepath = parsedargs.imagepath, 
+            imagesize = parsedargs.imagesize, 
+            debianversion = parsedargs.debianversion, 
+            kernel = parsedargs.kernel)
         image.go(
-            overwrite=parsed.overwrite, 
-            whatif=parsed.whatif)
+            overwrite=parsedargs.overwrite, 
+            statuslevel=parsedargs.statuslevel,
+            whatif=parsedargs.whatif)
 
-    elif parsed.subparser == 'info':
-        if parsed.imagepath:
-            image = OnionPiImage(imagepath=parsed.imagepath)
+    elif parsedargs.subparser == 'info':
+        if parsedargs.imagepath:
+            image = RaspSeedImage(imagepath=parsedargs.imagepath)
             print(image)
-        if parsed.levels:
-            print('Available images:')
-            #fakeimage = OnionPiImage('/nonexistent')
-            for k in OnionPiImage.statusmethods.keys():
-                print('{}: {}'.format(k, OnionPiImage.statusmethods[k].__name__))
+        if parsedargs.levels:
+            logging.basicConfig(format='%(levelname)s: %(message)s',level=logging.INFO)
+            image = RaspSeedImage(
+                imagepath = parsedargs.imagepath)
+            image.go(whatif=True)
 
-    elif parsed.subparser == 'detach':
-        image = OnionPiImage(imagepath=parsed.imagepath)
+    elif parsedargs.subparser == 'detach':
+        image = RaspSeedImage(imagepath=parsedargs.imagepath)
         image.detach_image()
-        if parsed.purge:
-            image.purge_files()
+
+    elif parsedargs.subparser == 'attach':
+        image = RaspSeedImage(imagepath=parsedargs.imagepath)
+        image.mount_chroot()
+
+def main(*args):
+    """A sample main() function that only gets called when raspseed.py is run directly"""
+    parser = get_argparser()
+    parsed = parse_args(parser, *args)
+    execute(parsed)
 
 if __name__ == '__main__':
     sys.exit(main(*sys.argv))

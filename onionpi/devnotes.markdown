@@ -35,7 +35,6 @@
 
 ## Less important TODO items
 
-- The OnionPi name is already taken and is boring and would taste gross
 - I fucking cannot get fucking locales to fucking work fucking noninteractively. I keep having to fucking `dpkg-reconfigure locales` and fucking manually fucking select the fucking locale.
     - Maybe this will help. i don't fuckin know though. http://www.debian-administration.org/article/394/Automating_new_Debian_installations_with_preseeding
     - This fucking didn't fucking help: http://stackoverflow.com/questions/8671308/non-interactive-method-for-dpkg-reconfigure
@@ -211,12 +210,12 @@ If you watch the output of the `qemu-deboostrap` command, it claims to invoke bo
 
 However, when I did it the Kali way, I was getting errors where you would try to chroot, but it would give you a permission denied error: 
 
-    > chroot /mnt/onionpi /bin/sh
+    > chroot /mnt/raspseed /bin/sh
     chroot: permission denied: /bin/sh
 
 I couldn't figure out why this was happening. The filesystems were mounted `exec`, `dev` and `proc` were mounted, and I was in a root shell. Switching to the `qemu-bootstrap` method seems to have fixed it. 
 
-I had also seen `udev` mount itself to `/mnt/onionpi/dev`, on top of the `dev` bind mount which I explicitly do in my build script. I had thought that perhaps doing things the Kali way was causing this, but I had contaminated my build environment and couldn't be sure. Now it looks like only `udev` is being mounted there. Perhaps that's the actual cause of this problem? 
+I had also seen `udev` mount itself to `/mnt/raspseed/dev`, on top of the `dev` bind mount which I explicitly do in my build script. I had thought that perhaps doing things the Kali way was causing this, but I had contaminated my build environment and couldn't be sure. Now it looks like only `udev` is being mounted there. Perhaps that's the actual cause of this problem? 
 
 ### Using sjoerd's binaries
 
