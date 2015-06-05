@@ -20,7 +20,7 @@ from pdb import set_trace as strace
 
 # TODO: would be better to have printed output & logging configured in the same place
 # TODO: if we need to capture the output of *one* chroot command, this doesn't work because of set -v
-def sh(commandline, env=None, printoutput=True, chroot=None, cwd=None):
+def sh(commandline, env=None, printoutput=True, chroot=None, chroot_disable_daemons=False, cwd=None):
     if type(commandline) is str:
         commandline = [commandline]
 
@@ -49,7 +49,13 @@ def sh(commandline, env=None, printoutput=True, chroot=None, cwd=None):
                     "     chroot: {}".format(chroot),
                     "     cwd:    {}".format(cwd),
                     "     env:    {}".format(env)]))
+
+        if chroot and chroot_disable_daemons:
+            disable_chroot_daemons()
         pristine_output = subprocess.check_output(cli, shell=True, env=env, cwd=cwd)
+        if chroot and chroot_disable_daemons:
+            enable_chroot_daemons()
+
         output = pristine_output.strip('\r\n') # Trims newlines @ beginning/end only
         if printoutput and len(output) > 0:
             print(output)
@@ -81,6 +87,26 @@ def write_file(contents, filename, append=True, mode=False, uniqueonly=False):
     if mode:
         os.chmod(filename, mode)
 
+disable_daemons_script = """
+#!/bin/sh
+set -e
+echo -e '#!/bin/sh\nexit 101' > /usr/sbin/policy-rc.d 
+chmod 755 /usr/sbin/policy-rc.d
+if ! dpkg-divert --list | grep 'local diversion of /usr/sbin/invoke-rc.d' >/dev/null; then 
+    dpkg-divert --add --local --divert /usr/sbin/invoke-rc.d.chroot --rename /usr/sbin/invoke-rc.d
+    cp /bin/true /usr/sbin/invoke-rc.d
+fi
+"""
+enable_daemons_script = """
+#!/bin/sh
+set -e
+rm -f /usr/sbin/policy-rc.d
+if dpkg-divert --list | grep 'local diversion of /usr/sbin/invoke-rc.d' >/dev/null; then 
+    rm -f /usr/sbin/invoke-rc.d
+    dpkg-divert --remove --rename /usr/sbin/invoke-rc.d
+fi
+"""
+
 def disable_chroot_daemons(chroot):
     """
     Disable daemons from starting in a chroot
@@ -88,12 +114,14 @@ def disable_chroot_daemons(chroot):
     """
     # Normally, policy-rc.d doesn't exist. If it does, then daemons have already been disabled
     if os.path.exists(chroot+'/usr/sbin/policy-rc.d'):
+        logging.debug("Daemons already disabled in chroot {}".format(chroot))
         return
+    logging.debug("Disabling daemons in chroot {}".format(chroot))
     write_file(['#!/bin/sh', 'exit 101'], chroot+'/usr/sbin/policy-rc.d', mode=0o755)
-    os.link(chroot+'/bin/true', chroot+'/usr/sbin/invoke-rc.d')
     sh(
         'dpkg-divert --add --local --divert /usr/sbin/invoke-rc.d.chroot --rename /usr/sbin/invoke-rc.d', 
         env={ 'LANG':'C' }, chroot=chroot)
+    os.copy(chroot+'/bin/true', chroot+'/usr/sbin/invoke-rc.d')
 
 def enable_chroot_daemons(chroot):
     """
@@ -102,7 +130,9 @@ def enable_chroot_daemons(chroot):
     """
     # In a pristine system, policy-rc.d doesn't exist; if it doesn't now, then daemons are already enabled
     if not os.path.exists(chroot+'/usr/sbin/policy-rc.d'):
+        logging.debug("Daemons already enabled in chroot {}".format(chroot))
         return
+    logging.debug("Enabling daemons in chroot {}".format(chroot))
     os.remove(chroot+'/usr/sbin/policy-rc.d')
     os.remove(chroot+'/usr/sbin/invoke-rc.d')
     sh(
@@ -138,19 +168,39 @@ def mount(device, mountpoint, fstype=None, fsoptions=None):
     if not ismounted:
         sh('mount {} {} "{}" "{}"'.format(fs_type, fs_options, device, mountpoint))
 
-def umount(mountpoint):
+# TODO: can't handle options or mountpoints with spaces! 
+#       python's built-in 'shlex' module may be of use here?
+def parse_mtab():
+    mtab = []
+    with open('/etc/mtab') as f:
+        for line in f.readlines():
+            fields = line.split(' ')
+            mtab.append({
+                    'fs_spec':    fields[0],
+                    'fs_file':    fields[1],
+                    'fs_vfstype': fields[2],
+                    'fs_mntops':  fields[3],
+                    'fs_freq':    fields[4],
+                    'fs_passno':  fields[5]})
+    return mtab
+
+def is_mounted(mountpoint):
+    for fs in parse_mtab():
+        if fs['fs_file'] == mountpoint:
+            return True
+    else:
+        return False
+
+# TODO: if lsof is available, show all processes using the mountpoint
+def umount(mountpoint, lsof_on_failure=True):
     """Use /bin/umount to unmount a device"""
-    if os.path.exists(mountpoint):
+    if is_mounted(mountpoint):
         try:
             sh('umount "{}"'.format(mountpoint))
         except:
-            pass
-    # for mount in sh('mount', printoutput=False).split('\n'):
-    #     exdevice, exmountpoint = re.search('(.+) on (.+) type ', mount).group(1, 2)
-    #     if mount['fstype'] and exmountpoint == mountpoint:
-    #         sh('umount "{}"'.format(mountpoint))
-    #     elif exdevice == device:
-    #         sh('umount'.format(
+            print('The following process are still using your mountpoint:')
+            print(sh('lsof | grep {}'.format(mountpoint)))
+            raise
 
 def check_loopdev(image):
     """Use /sbin/losetup to check if an image has been attached as a loopback device"""
@@ -220,7 +270,7 @@ class RaspSeedImage(object):
 
     def __init__(self, imagepath=os.getcwd()+default_imagename,
                  imagesize=None, debianversion="sid",
-                 kernel="sjoerd"):
+                 kernel="sjoerd", overlaydir=None):
         '''
         __init__() should *not* make any modifications to actual files on disk! We rely on this in various places, so if it changes, stuff might break and **data could be deleted**.
         '''
@@ -237,6 +287,7 @@ class RaspSeedImage(object):
         self.kernel     = kernel
         self.rootdev    = None 
         self.bootdev    = None
+        self.overlaydir = overlaydir
 
         if os.path.isfile(self.imagepath):
             self.imagesize = os.stat(self.imagepath).st_size / 1024 / 1024
@@ -367,7 +418,12 @@ class RaspSeedImage(object):
     def mount_chroot(self):
         self.setup_loopback_partitions()
         for m in self.mounts:
-            mount(device=m['device'], mountpoint=m['mountpoint'], 
+            # the loopback command in setup_loopback_partitions returns immediately, even if
+            # the fucking /dev/mapper devices haven't been created yet
+            if m['device'].startswith('/dev/mapper') and not is_mounted(m):
+                time.sleep(3)
+            mount(
+                device=m['device'], mountpoint=m['mountpoint'], 
                 fstype=m['fstype'], fsoptions=m['fsoptions'])
 
     @statusmethod
@@ -380,10 +436,13 @@ class RaspSeedImage(object):
     def debootstrap_stage3(self):
         self.mount_chroot()
 
+        write_file(disable_daemons_script, self.mountpoint+'/root/disable_daemons.sh', append=False, mode=0o700)
+        write_file(enable_daemons_script, self.mountpoint+'/root/enable_daemons.sh', append=False, mode=0o700)
+
         sl_new = [
             'deb http://ftp.debian.org/debian {} main contrib non-free'.format(self.debianvers),
             'deb-src http://ftp.debian.org/debian {} main contrib non-free'.format(self.debianvers)]
-        write_file(sl_new, self.mountpoint+"/etc/apt/sources.list", append=True, mode=0o644)
+        write_file(sl_new, self.mountpoint+"/etc/apt/sources.list", mode=0o644)
 
         write_file([self.hostname], self.mountpoint+"/etc/hostname", append=False, mode=0o644)
 
@@ -421,13 +480,12 @@ class RaspSeedImage(object):
             'DEBIAN_FRONTEND':'noninteractive'
         }
 
-        additional_packages = 'apt-transport-https aptitude file openssh-client openssh-server'
+        # stuff you probably want
+        additional_packages = 'apt-transport-https aptitude file openssh-client openssh-server iw usbutils ntp'
+        # TODO: micah's stuff you probably want to remove
+        additional_packages+= 'python python-pip emacs24-nox screen git'
 
         stage3cmd = [
-            'dpkg-divert --add --local --divert /usr/sbin/invoke-rc.d.chroot --rename /usr/sbin/invoke-rc.d',
-            'cp /bin/true /usr/sbin/invoke-rc.d',
-            'echo -e "#!/bin/sh\nexit 101" > /usr/sbin/policy-rc.d',
-            'chmod +x /usr/sbin/policy-rc.d',
             'apt-get update',
             'apt-get install locales locales-all debconf-utils',
             'debconf-set-selections /debconf.set',
@@ -451,23 +509,19 @@ class RaspSeedImage(object):
             'update-rc.d ssh enable',
             # Cleanup: 
             'rm -f /etc/ssh_host_*_key.pub',
-            'rm -f /usr/sbin/policy-rc.d',
-            'rm -f /usr/sbin/invoke-rc.d',
-            'dpkg-divert --remove --rename /usr/sbin/invoke-rc.d',
             'rm -rf /root/.bash_history',
             'apt-get clean',
-            'rm -f /0',
-            'rm -f /hs_err*',
             # 'rm -f /usr/bin/qemu*', # Keep this around if you want to keep chrooting in there
-            ]
-        sh(stage3cmd, env=thirdstage_env, chroot=self.mountpoint)
+            'rm -f /0',
+            'rm -f /hs_err*']
+        sh(stage3cmd, env=thirdstage_env, chroot=self.mountpoint, chroot_disable_daemons=True)
 
-        write_file(["T0:23:respawn:/sbin/agetty -L ttyAMA0 115200 vt100"], self.mountpoint+"/etc/inittab", append=True)
+        write_file(["T0:23:respawn:/sbin/agetty -L ttyAMA0 115200 vt100"], self.mountpoint+"/etc/inittab")
 
-    def test_chroot(self):
-        # Just useful for testing that my chroot still works
-        #sh("chroot {} /bin/ls /dev".format(self.mountpoint))
-        return
+        fstab_contents = [
+            '/dev/mmcblk0p1  /boot   vfat   ro                0       2',
+            '/dev/mmcblk0p2  /       ext4   defaults,noatime  0       1']
+        write_file(fstab_contents, "{}/etc/fstab".format(self.mountpoint), mode=0o644)
 
     def obtain_kernel_source(self, kernel):
         k = self.compilable_kernels[kernel]
@@ -555,6 +609,10 @@ class RaspSeedImage(object):
             self.obtain_kernel_source(self.kernel)
             self.compile_linux_kernel(self.kernel)
 
+    @statusmethod
+    def copy_overlay(self):
+        if self.overlaydir:
+            shutil.copytree(self.overlaydir, self.mountpoint, symlinks=True)
 
     # TODO: this doesn't require u-boot, meaning that the kernel step and the stage3 step are more segregated than my infrastructure currently allows. 
     # WHICH IS GOOD because apparently uboot is broken in jessie rn? Although the Pi 2 is supported in mainline UBoot so I could just build it myself
@@ -563,18 +621,13 @@ class RaspSeedImage(object):
         sl_new = [
             'deb https://repositories.collabora.co.uk/debian/ jessie rpi2',
             'deb http://ftp.debian.org/debian experimental main']
-        write_file(sl_new, self.mountpoint+"/etc/apt/sources.list", append=True, mode=0o644)
+        write_file(sl_new, self.mountpoint+"/etc/apt/sources.list", mode=0o644)
 
         sjoerd_env = {
             'LANG':'C', 
             'DEBIAN_FRONTEND':'noninteractive'
         }
         sjcommand = [
-            # Prevent daemons from starting in the chroot:
-            'dpkg-divert --add --local --divert /usr/sbin/invoke-rc.d.chroot --rename /usr/sbin/invoke-rc.d',
-            'cp /bin/true /usr/sbin/invoke-rc.d',
-            'echo -e "exit 101" > /usr/sbin/policy-rc.d',
-            'chmod +x /usr/sbin/policy-rc.d',
             # Do the work you need to do: 
             'apt-get update',
             # NOTE: package can't be authenticated. would be better to import the key out of band first, but until then, --force-yes:
@@ -584,12 +637,8 @@ class RaspSeedImage(object):
             'apt-get -t experimental install linux-kbuild-3.18',
             # NOTE: sjoerd's page says the package is raspberrypi-firmware-nokernel. Nope. It's apparently raspberrypi-bootloader-nokernel.
             # NOTE: for some reason even after installing the keyring it can't auth at least some of these packages. I have to use --force-yes again. 
-            'apt-get install -y --force-yes raspberrypi-bootloader-nokernel linux-image-3.18.0-trunk-rpi2 linux-headers-3.18.0-trunk-rpi2',
-            # Re-enable daemons in the chroot:
-            'rm -f /usr/sbin/policy-rc.d',
-            'rm -f /usr/sbin/invoke-rc.d',
-            'dpkg-divert --remove --rename /usr/sbin/invoke-rc.d']
-        sh(sjcommand, env=sjoerd_env, chroot=self.mountpoint)
+            'apt-get install -y --force-yes raspberrypi-bootloader-nokernel linux-image-3.18.0-trunk-rpi2 linux-headers-3.18.0-trunk-rpi2']
+        sh(sjcommand, env=sjoerd_env, chroot=self.mountpoint, chroot_disable_daemons=True)
 
         # Copy the kernel & supporting files to the place that the Pi expects
         kpath = sh('chroot {} dpkg-query -L linux-image-3.18.0-trunk-rpi2 | grep vmlinuz'.format(self.mountpoint), env=sjoerd_env)
@@ -598,12 +647,6 @@ class RaspSeedImage(object):
         # create a cmdline.txt file. Uses the Raspbian one as a starting point
         cmdline_contents = "dwc_otg.lpm_enable=0 console=ttyAMA0,115200 root=/dev/mmcblk0p2 rootfstype=ext4 elevator=deadline rootwait"
         write_file(cmdline_contents, "{}/boot/firmware/cmdline.txt".format(self.mountpoint))
-
-        fstab_contents = [
-            'proc            /proc           proc    defaults          0       0',
-            '/dev/mmcblk0p1  /boot           vfat    defaults          0       2',
-            '/dev/mmcblk0p2  /               ext4    defaults,noatime  0       1']
-        write_file(fstab_contents, "{}/etc/fstab".format(self.mountpoint), mode=0o644)
 
     def detach_image(self):
         for m in reversed(self.mounts):
@@ -629,7 +672,7 @@ class RaspSeedImage(object):
         logging.info("SHA1 for image at '{}' is '{}'".format(self.imagepath, self.sha1sum))
         write_file(self.sha1sum, "{}.sha1".format(self.imagepath), append=False)
 
-    def go(self, statuslevel=None, overwrite=False, whatif=False):
+    def buildup(self, statuslevel=None, overwrite=False, whatif=False):
         global finalstatus, statusmethods
 
         print("Image {} starting at status {}".format(self.imagename, self.status))
@@ -715,6 +758,9 @@ def get_argparser():
     detachs = subparsers.add_parser('detach', parents=[imagep])
 
     attachs = subparsers.add_parser('attach', parents=[imagep])
+    attachs.add_argument(
+        '--chroot', '-c', action='store_true', 
+        help='Open a chroot shell into the mounted directory after attaching')
 
     # TODO: Add a way to tell it to bring it to a specific status level
     images = subparsers.add_parser('image', parents=[imagep])
@@ -728,8 +774,8 @@ def get_argparser():
         '--debianversion', '-d', action='store', default='sid',
         help='The version of debian to use')
     images.add_argument(
-        '--overwrite', '-o', action='store_true', 
-        help='Delete any existing image file')
+        '--force', '-f', action='store_true', 
+        help='Force create, even if there is an existing image file')
     images.add_argument(
         '--whatif', '-n', action='store_true',
         help='Take no action, but print what actions would be taken')
@@ -741,6 +787,9 @@ def get_argparser():
              'from sjoerd (working), compile the mainline kernel (currently',
              'broken), or compile the kernel w/ patches from the Raspberry Pi',
              'Foundation (unimplemented).']))
+    images.add_argument(
+        '--overlay-directory', '-o', action='store', default=None, 
+        destination='overlaydir', help='Copy an overlay onto the chroot')
 
     return argparser
 
@@ -763,7 +812,7 @@ def parse_args(parser, *args):
 def execute(parsedargs, post_setup=None, post_image=None):
 
     if parsedargs.subparser == 'setup':
-        if parsedargs.prereqss: install_prereqs()
+        if parsedargs.prereqs: install_prereqs()
         if parsedargs.collabora: download_collabora_repo()
 
     elif parsedargs.subparser == 'image':
@@ -771,9 +820,10 @@ def execute(parsedargs, post_setup=None, post_image=None):
             imagepath = parsedargs.imagepath, 
             imagesize = parsedargs.imagesize, 
             debianversion = parsedargs.debianversion, 
-            kernel = parsedargs.kernel)
-        image.go(
-            overwrite=parsedargs.overwrite, 
+            kernel = parsedargs.kernel, 
+            overlaydir = parsedargs.overlaydir)
+        image.buildup(
+            overwrite=parsedargs.force, 
             statuslevel=parsedargs.statuslevel,
             whatif=parsedargs.whatif)
 
@@ -785,7 +835,7 @@ def execute(parsedargs, post_setup=None, post_image=None):
             logging.basicConfig(format='%(levelname)s: %(message)s',level=logging.INFO)
             image = RaspSeedImage(
                 imagepath = parsedargs.imagepath)
-            image.go(whatif=True)
+            image.buildup(whatif=True)
 
     elif parsedargs.subparser == 'detach':
         image = RaspSeedImage(imagepath=parsedargs.imagepath)
@@ -794,6 +844,8 @@ def execute(parsedargs, post_setup=None, post_image=None):
     elif parsedargs.subparser == 'attach':
         image = RaspSeedImage(imagepath=parsedargs.imagepath)
         image.mount_chroot()
+        #if parsedargs.chroot:
+            # TODO! Open a shell here
 
 def main(*args):
     """A sample main() function that only gets called when raspseed.py is run directly"""
