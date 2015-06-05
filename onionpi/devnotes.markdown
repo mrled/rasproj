@@ -38,7 +38,13 @@
 - I fucking cannot get fucking locales to fucking work fucking noninteractively. I keep having to fucking `dpkg-reconfigure locales` and fucking manually fucking select the fucking locale.
     - Maybe this will help. i don't fuckin know though. http://www.debian-administration.org/article/394/Automating_new_Debian_installations_with_preseeding
     - This fucking didn't fucking help: http://stackoverflow.com/questions/8671308/non-interactive-method-for-dpkg-reconfigure
-- The deboostrap steps I use result in some fucked up characters getting written to the serial console during boot. Still works to log in but it looks ugly.
+- The systemd boot process is fucking annoying me. 
+    - It slows down sometimes, but it's fast other times
+    - http://ubuntuforums.org/showthread.php?t=2217967 - I'm seeing this "random: nonblocking pool is initialized" bullshit for 60 secs or so every boot now
+    - Turns out I haven't been using a read-write / filesystem, so maybe this would only happen once if it could write the results? 
+    - It prints fucked up characters during part of the boot phase so text overwrites on top of itself
+    - When no wifi cards are detected it appears to take a long time to boot
+    - Basically seems like lots of timeouts are dumb and fuck 
     
 ## Experiments / troubleshooting
 
