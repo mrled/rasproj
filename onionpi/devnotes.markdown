@@ -51,6 +51,18 @@ A logbook of cargo-cult-ish-ness
 
 Notes about specific problems I overcame and why certain decisions were made
 
+### Host system
+
+Finding a host system that can work is kind of a pain in the ass. Sometimes the Debian wiki can help: https://wiki.debian.org/CrossToolchains
+
+However, that info appears that it's out of date. It says that there aren't Wheezy packages on emdebian, but when I look in their repository (http://emdebian.org/tools/debian/), I do see some. I'm going to give that a try. 
+
+HOWEVER2, it appears that there are only amd64 packages for wheezy in there! (See http://emdebian.org/tools/debian/dists/wheezy/main/ ... also, do note that there *are* i386 packages up there for jessie)
+
+HOWEVER3 (christ), the cross-build package isn't in there. So we're back to using Jessie. 
+
+I wonder if it would be easier to get a fucking cross dev environment working on fucking Ubuntu
+
 ### Using debconf
 
 Run `debconf-get-selections` to see all the possible customizations in any installed package. 
